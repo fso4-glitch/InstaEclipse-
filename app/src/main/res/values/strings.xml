@@ -435,9 +435,9 @@
     <string name="ig_instant_upload_chip">🖼 Gallery</string>
     <string name="ig_instant_upload_chip_ready">✓ Ready — tap shutter</string>
     <string name="ig_instant_upload_ready">Picked! Tap the shutter to send it as an Instant</string>
-    <string name="ig_instant_upload_video_ready">Video selected! Hold the shutter briefly to trigger the Instant video send.</string>
+    <string name="ig_instant_upload_video_ready">Video selected! Tap the shutter to send it as an Instant.</string>
     <string name="ig_instant_upload_video_fail">Could not load that video.</string>
-    <string name="ig_instant_upload_chip_video_ready">✓ Video ready — hold shutter</string>
+    <string name="ig_instant_upload_chip_video_ready">✓ Video ready — tap shutter</string>
     <string name="ig_instant_upload_fail">Couldn\'t load that image</string>
 
     <!-- Backup &amp; Restore -->
