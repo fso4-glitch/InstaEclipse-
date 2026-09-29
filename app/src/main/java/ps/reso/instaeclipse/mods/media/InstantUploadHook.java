@@ -54,6 +54,7 @@ public class InstantUploadHook {
 
     static volatile Bitmap pendingBitmap;
     private static volatile File pendingVideoFile;
+    private static volatile Method videoSendMethod;
     private static volatile long pendingSetAt = 0;
     private static volatile long pendingVideoSetAt = 0;   // when pendingBitmap was armed (staleness guard)
     private static final long PENDING_TTL_MS = 5 * 60 * 1000;
@@ -90,6 +91,24 @@ public class InstantUploadHook {
                                 && System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
                             pendingBitmap = null;
                         }
+                        // If a gallery video is armed, a NORMAL shutter tap becomes the trigger.
+                        // We invoke Instagram's own QuickSnap video-send method with the selected
+                        // file instead of requiring a long-press/recording gesture.
+                        if (FeatureFlags.uploadInstants && pendingVideoFile != null) {
+                            if (dispatchPendingVideoFromPhotoTap(p.args)) {
+                                p.setResult(null); // suppress the normal photo send
+                                FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                                return;
+                            }
+                            Activity act = currentActivity();
+                            if (act != null) {
+                                FeedVideoDownloadHook.mainHandler.post(() ->
+                                        Toast.makeText(act,
+                                                I18n.t(act, R.string.ig_instant_upload_video_fail),
+                                                Toast.LENGTH_SHORT).show());
+                            }
+                        }
+
                         if (FeatureFlags.uploadInstants && pendingBitmap != null) {
                             p.args[1] = pendingBitmap;
                             if (p.args[2] != null)
@@ -135,6 +154,10 @@ public class InstantUploadHook {
                 }
                 // On IG 447 this structurally matches QuickSnapCameraViewModel.A03(..., File, ...).
                 if (fileIndex < 0 || !hasBitmap || !hasContext) continue;
+                if (videoSendMethod == null) {
+                    try { m.setAccessible(true); } catch (Throwable ignored) {}
+                    videoSendMethod = m;
+                }
                 final int targetFileIndex = fileIndex;
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
@@ -161,6 +184,86 @@ public class InstantUploadHook {
             ModuleLog.line("(IE|InstantUpload) ✅ video-file hook installed (" + hooked + ")");
         } catch (Throwable t) {
             ModuleLog.line("(IE|InstantUpload) ⚠️ video swap install: " + t.getMessage());
+        }
+    }
+
+
+    /**
+     * Turns a regular photo-shutter tap into a video Instant send when a gallery video is pending.
+     * Best-effort argument mapping keeps this resilient to obfuscated parameter names.
+     */
+    private static boolean dispatchPendingVideoFromPhotoTap(Object[] photoArgs) {
+        Method m = videoSendMethod;
+        File video = pendingVideoFile;
+        if (m == null || video == null) {
+            ModuleLog.line("(IE|InstantUpload) ⚠️ tap-to-video unavailable: video method not found");
+            return false;
+        }
+
+        try {
+            Class<?>[] pt = m.getParameterTypes();
+            Object[] args = new Object[pt.length];
+            Activity act = currentActivity();
+            Bitmap fallbackBitmap = null;
+
+            if (photoArgs != null) {
+                for (Object a : photoArgs) {
+                    if (a instanceof Bitmap) {
+                        fallbackBitmap = (Bitmap) a;
+                        break;
+                    }
+                }
+            }
+
+            for (int i = 0; i < pt.length; i++) {
+                Class<?> t = pt[i];
+
+                if (t == File.class) {
+                    args[i] = video;
+                    continue;
+                }
+                if (android.content.Context.class.isAssignableFrom(t)) {
+                    args[i] = act;
+                    continue;
+                }
+                if (t == Bitmap.class) {
+                    args[i] = fallbackBitmap;
+                    continue;
+                }
+
+                Object matched = null;
+                if (photoArgs != null) {
+                    for (Object a : photoArgs) {
+                        if (a != null && t.isInstance(a)) {
+                            matched = a;
+                            break;
+                        }
+                    }
+                }
+                if (matched != null) {
+                    args[i] = matched;
+                    continue;
+                }
+
+                if (t == boolean.class) args[i] = false;
+                else if (t == byte.class) args[i] = (byte) 0;
+                else if (t == short.class) args[i] = (short) 0;
+                else if (t == int.class) args[i] = 0;
+                else if (t == long.class) args[i] = 0L;
+                else if (t == float.class) args[i] = 0f;
+                else if (t == double.class) args[i] = 0d;
+                else if (t == char.class) args[i] = (char) 0;
+                else args[i] = null;
+            }
+
+            m.invoke(null, args);
+            // If the Xposed video hook did not consume it, consume it here after invocation.
+            if (pendingVideoFile == video) pendingVideoFile = null;
+            ModuleLog.line("(IE|InstantUpload) ✅ dispatched gallery video from shutter tap");
+            return true;
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) ❌ tap-to-video dispatch: " + t);
+            return false;
         }
     }
 
