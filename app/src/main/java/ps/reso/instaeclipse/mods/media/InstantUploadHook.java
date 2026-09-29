@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.ImageDecoder;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.media.MediaMetadataRetriever;
 import android.os.Build;
 import android.provider.MediaStore;
 import android.view.Gravity;
@@ -17,6 +18,9 @@ import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 
@@ -49,7 +53,9 @@ public class InstantUploadHook {
     private static final int PICK_REQUEST = 0x1E5A; // unique request code for our picker
 
     static volatile Bitmap pendingBitmap;
-    private static volatile long pendingSetAt = 0;   // when pendingBitmap was armed (staleness guard)
+    private static volatile File pendingVideoFile;
+    private static volatile long pendingSetAt = 0;
+    private static volatile long pendingVideoSetAt = 0;   // when pendingBitmap was armed (staleness guard)
     private static final long PENDING_TTL_MS = 5 * 60 * 1000;
     private static TextView chip;              // the injected gallery chip (main thread only)
     private static ImageView preview;          // full-screen preview of the picked image
@@ -58,6 +64,7 @@ public class InstantUploadHook {
 
     public void install(ClassLoader cl) {
         hookSwap(cl);
+        hookVideoSwap(cl);
         hookCameraOpen(cl);
         hookPickerResult();
     }
@@ -100,6 +107,60 @@ public class InstantUploadHook {
             ModuleLog.line("(IE|InstantUpload) ✅ A02 hooked");
         } catch (Throwable t) {
             ModuleLog.line("(IE|InstantUpload) ⚠️ swap install: " + t.getMessage());
+        }
+    }
+
+
+    /**
+     * Experimental video swap for Instagram 447.0.0.21.81.
+     *
+     * QuickSnap's video path has a static ViewModel method that receives the recorded
+     * java.io.File. When a gallery video is armed, replace that recorded file with our
+     * cached gallery copy and let Instagram's own Instant pipeline process/send it.
+     */
+    private void hookVideoSwap(ClassLoader cl) {
+        try {
+            Class<?> vm = XposedHelpers.findClass(VM_CLASS, cl);
+            int hooked = 0;
+            for (Method m : vm.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                int fileIndex = -1;
+                boolean hasBitmap = false;
+                boolean hasContext = false;
+                for (int i = 0; i < pt.length; i++) {
+                    if (pt[i] == File.class && fileIndex < 0) fileIndex = i;
+                    if (pt[i] == Bitmap.class) hasBitmap = true;
+                    if (pt[i] == android.content.Context.class) hasContext = true;
+                }
+                // On IG 447 this structurally matches QuickSnapCameraViewModel.A03(..., File, ...).
+                if (fileIndex < 0 || !hasBitmap || !hasContext) continue;
+                final int targetFileIndex = fileIndex;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            if (pendingVideoFile != null
+                                    && System.currentTimeMillis() - pendingVideoSetAt > PENDING_TTL_MS) {
+                                safeDelete(pendingVideoFile);
+                                pendingVideoFile = null;
+                            }
+                            if (!FeatureFlags.uploadInstants || pendingVideoFile == null) return;
+                            if (targetFileIndex >= p.args.length || !(p.args[targetFileIndex] instanceof File)) return;
+
+                            p.args[targetFileIndex] = pendingVideoFile;
+                            pendingVideoFile = null;
+                            FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                            ModuleLog.line("(IE|InstantUpload) ✅ swapped in gallery video file");
+                        } catch (Throwable t) {
+                            ModuleLog.line("(IE|InstantUpload) ❌ video swap: " + t);
+                        }
+                    }
+                });
+                hooked++;
+            }
+            ModuleLog.line("(IE|InstantUpload) ✅ video-file hook installed (" + hooked + ")");
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) ⚠️ video swap install: " + t.getMessage());
         }
     }
 
@@ -251,7 +312,8 @@ public class InstantUploadHook {
     private static void launchPicker(Activity act) {
         try {
             Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-            i.setType("image/*");
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
             i.addCategory(Intent.CATEGORY_OPENABLE);
             act.startActivityForResult(Intent.createChooser(i,
                     I18n.t(act, R.string.ig_instant_upload_chip)), PICK_REQUEST);
@@ -274,11 +336,35 @@ public class InstantUploadHook {
                                 Uri uri = ((Intent) p.args[2]).getData();
                                 if (uri == null) return;
                                 Activity act = (Activity) p.thisObject;
+                                String mime = null;
+                                try { mime = act.getContentResolver().getType(uri); } catch (Throwable ignored) {}
+
+                                if (mime != null && mime.startsWith("video/")) {
+                                    File video = copyVideoToCache(act, uri, mime);
+                                    if (video == null) {
+                                        Toast.makeText(act, I18n.t(act, R.string.ig_instant_upload_video_fail),
+                                                Toast.LENGTH_SHORT).show();
+                                        return;
+                                    }
+                                    if (pendingVideoFile != null) safeDelete(pendingVideoFile);
+                                    pendingVideoFile = video;
+                                    pendingVideoSetAt = System.currentTimeMillis();
+                                    pendingBitmap = null;
+                                    markChipReadyVideo(act, uri);
+                                    Toast.makeText(act, I18n.t(act, R.string.ig_instant_upload_video_ready),
+                                            Toast.LENGTH_LONG).show();
+                                    return;
+                                }
+
                                 Bitmap bmp = decode(act, uri);
                                 if (bmp == null) {
                                     Toast.makeText(act, I18n.t(act, R.string.ig_instant_upload_fail),
                                             Toast.LENGTH_SHORT).show();
                                     return;
+                                }
+                                if (pendingVideoFile != null) {
+                                    safeDelete(pendingVideoFile);
+                                    pendingVideoFile = null;
                                 }
                                 pendingBitmap = bmp;
                                 pendingSetAt = System.currentTimeMillis();
@@ -294,6 +380,61 @@ public class InstantUploadHook {
         } catch (Throwable t) {
             ModuleLog.line("(IE|InstantUpload) ⚠️ picker-result: " + t.getMessage());
         }
+    }
+
+
+    private static File copyVideoToCache(Activity act, Uri uri, String mime) {
+        File out = null;
+        try {
+            String ext = (mime != null && mime.contains("quicktime")) ? ".mov" : ".mp4";
+            out = new File(act.getCacheDir(), "instaeclipse_instant_" + System.currentTimeMillis() + ext);
+            try (InputStream in = act.getContentResolver().openInputStream(uri);
+                 FileOutputStream fos = new FileOutputStream(out)) {
+                if (in == null) return null;
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
+                fos.flush();
+            }
+            if (!out.exists() || out.length() == 0) {
+                safeDelete(out);
+                return null;
+            }
+            return out;
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) ❌ video copy: " + t);
+            safeDelete(out);
+            return null;
+        }
+    }
+
+    private static void markChipReadyVideo(Activity act, Uri uri) {
+        try {
+            if (preview == null) {
+                MediaMetadataRetriever mmr = new MediaMetadataRetriever();
+                try {
+                    mmr.setDataSource(act, uri);
+                    Bitmap frame = mmr.getFrameAtTime(0);
+                    if (frame != null) markChipReady(act, downscale(frame));
+                } finally {
+                    try { mmr.release(); } catch (Throwable ignored) {}
+                }
+            }
+            if (chip != null) {
+                chip.setText(I18n.t(act, R.string.ig_instant_upload_chip_video_ready));
+                GradientDrawable bg = new GradientDrawable();
+                bg.setColor(Color.parseColor("#CC30D158"));
+                bg.setCornerRadius(dp(act, 22));
+                chip.setBackground(bg);
+                chip.bringToFront();
+            }
+        } catch (Throwable ignored) {
+            if (chip != null) chip.setText(I18n.t(act, R.string.ig_instant_upload_chip_video_ready));
+        }
+    }
+
+    private static void safeDelete(File f) {
+        try { if (f != null && f.exists()) f.delete(); } catch (Throwable ignored) {}
     }
 
     // Cap the picked image's long edge. Full-resolution gallery photos (e.g. 4000×3000) can
