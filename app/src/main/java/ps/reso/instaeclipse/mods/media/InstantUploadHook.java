@@ -62,44 +62,64 @@ public class InstantUploadHook {
         hookPickerResult();
     }
 
-    // ── 4. The bitmap swap (verified: A02 arg1 = captured Bitmap) ──────────────
+    // ── 4. Photo-only bitmap swap. Never interfere with video recording. ─────────
     private void hookSwap(ClassLoader cl) {
         try {
             Class<?> vm = XposedHelpers.findClass(VM_CLASS, cl);
-            Method a02 = null;
+            int hooked = 0;
+            // Instagram obfuscates method names across builds. Hook every static
+            // QuickSnap send candidate with two Bitmap parameters, but only act
+            // when an IMAGE was selected and is pending.
             for (Method m : vm.getDeclaredMethods()) {
                 if (!Modifier.isStatic(m.getModifiers())) continue;
-                int bmp = 0;
-                for (Class<?> t : m.getParameterTypes()) if (t == Bitmap.class) bmp++;
-                if (bmp >= 2) { a02 = m; break; }
-            }
-            if (a02 == null) { ModuleLog.line("(IE|InstantUpload) ⚠️ A02 not found"); return; }
-            XposedBridge.hookMethod(a02, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!(p.args[1] instanceof Bitmap)) return; // suspend re-entry passes nulls
-                        // Drop a stale pick so it can't hijack a much-later real capture.
-                        if (pendingBitmap != null
-                                && System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
-                            pendingBitmap = null;
+                final Class<?>[] types = m.getParameterTypes();
+                int bitmapCount = 0;
+                for (Class<?> type : types) if (type == Bitmap.class) bitmapCount++;
+                if (bitmapCount < 2) continue;
+                try {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            try {
+                                if (!FeatureFlags.uploadInstants || pendingBitmap == null) return;
+                                if (System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
+                                    pendingBitmap = null;
+                                    return;
+                                }
+                                // Only replace a real photo-capture invocation, not
+                                // a suspend continuation or a video recording call.
+                                int first = -1, second = -1;
+                                for (int i = 0; i < types.length && i < p.args.length; i++) {
+                                    if (types[i] != Bitmap.class || !(p.args[i] instanceof Bitmap)) continue;
+                                    if (first == -1) first = i;
+                                    else { second = i; break; }
+                                }
+                                if (first == -1) return;
+                                Bitmap picked = pendingBitmap;
+                                p.args[first] = picked;
+                                if (second != -1) {
+                                    Bitmap.Config config = picked.getConfig();
+                                    p.args[second] = picked.copy(
+                                            config != null ? config : Bitmap.Config.ARGB_8888, false);
+                                }
+                                pendingBitmap = null;
+                                FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                                ModuleLog.line("(IE|InstantUpload) photo swapped method="
+                                        + m.getName() + " bitmapArg=" + first
+                                        + " secondaryArg=" + second);
+                            } catch (Throwable t) {
+                                ModuleLog.line("(IE|InstantUpload) photo swap error: " + t);
+                            }
                         }
-                        if (FeatureFlags.uploadInstants && pendingBitmap != null) {
-                            p.args[1] = pendingBitmap;
-                            if (p.args[2] != null)
-                                p.args[2] = pendingBitmap.copy(pendingBitmap.getConfig(), false);
-                            pendingBitmap = null;
-                            FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
-                            ModuleLog.line("(IE|InstantUpload) ✅ swapped in gallery bitmap");
-                        }
-                    } catch (Throwable t) {
-                        ModuleLog.line("(IE|InstantUpload) ❌ swap: " + t);
-                    }
+                    });
+                    hooked++;
+                } catch (Throwable t) {
+                    ModuleLog.line("(IE|InstantUpload) candidate hook error: " + t);
                 }
-            });
-            FeatureStatusTracker.setHooked("UploadInstants");
-            ModuleLog.line("(IE|InstantUpload) ✅ A02 hooked");
+            }
+            if (hooked > 0) FeatureStatusTracker.setHooked("UploadInstants");
+            ModuleLog.line("(IE|InstantUpload) photo candidate hooks installed=" + hooked);
         } catch (Throwable t) {
-            ModuleLog.line("(IE|InstantUpload) ⚠️ swap install: " + t.getMessage());
+            ModuleLog.line("(IE|InstantUpload) photo hook install error: " + t);
         }
     }
 
