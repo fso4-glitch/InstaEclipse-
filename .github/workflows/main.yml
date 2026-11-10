@@ -31,9 +31,8 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      # Step 3: Set up Android SDK
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v2
+      # GitHub ubuntu-latest already includes Android SDK. Avoid the obsolete
+      # setup-android action, which requests the removed SDK 'tools' package.
 
       # Step 4: Grant execution permissions to gradlew
       - name: Grant execute permission to gradlew
