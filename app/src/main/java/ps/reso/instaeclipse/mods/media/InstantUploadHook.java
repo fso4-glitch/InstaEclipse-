@@ -76,6 +76,24 @@ public class InstantUploadHook {
     private void hookSwap(ClassLoader cl) {
         try {
             Class<?> vm = XposedHelpers.findClass(VM_CLASS, cl);
+            // Diagnostics only: report the actual photo-related signatures in this IG build.
+            // Do not hook these candidates until their behavior has been verified.
+            int diagnosticCount = 0;
+            for (Method candidate : vm.getDeclaredMethods()) {
+                Class<?>[] params = candidate.getParameterTypes();
+                boolean mediaRelated = false;
+                for (Class<?> param : params) {
+                    if (param == Bitmap.class || param == File.class
+                            || param == byte[].class || param == Uri.class) {
+                        mediaRelated = true;
+                        break;
+                    }
+                }
+                if (!mediaRelated) continue;
+                ModuleLog.line("(IE|InstantUpload) PHOTO_METHOD " + candidate.toGenericString());
+                diagnosticCount++;
+            }
+            ModuleLog.line("(IE|InstantUpload) PHOTO_METHOD_COUNT=" + diagnosticCount);
             int hooked = 0;
             for (Method method : vm.getDeclaredMethods()) {
                 if (!Modifier.isStatic(method.getModifiers())) continue;
