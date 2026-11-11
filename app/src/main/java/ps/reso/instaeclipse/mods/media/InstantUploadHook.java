@@ -134,7 +134,13 @@ public class InstantUploadHook {
                                     ModuleLog.line("(IE|InstantUpload) photo pending, no live Bitmap in " + method.getName());
                                     return;
                                 }
-                                p.args[primary] = photo;
+                                final int diagnosticWidth = photo.getWidth();
+                            final int diagnosticHeight = photo.getHeight();
+                            ModuleLog.line("(IE|InstantUpload) photo swap input dimensions="
+                                    + diagnosticWidth + "x" + diagnosticHeight
+                                    + " config=" + photo.getConfig()
+                                    + " recycled=" + photo.isRecycled());
+                            p.args[primary] = photo;
                                 if (secondary >= 0) {
                                     Bitmap.Config cfg = photo.getConfig();
                                     p.args[secondary] = photo.copy(
@@ -146,6 +152,19 @@ public class InstantUploadHook {
                                         + method.getName() + " at " + primary + "/" + secondary);
                             } catch (Throwable t) {
                                 ModuleLog.line("(IE|InstantUpload) photo swap error: " + t);
+                            }
+                        }
+                    });
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            if (!FeatureFlags.uploadInstants) return;
+                            Throwable error = p.getThrowable();
+                            if (error != null) {
+                                ModuleLog.line("(IE|InstantUpload) A02 returned throwable: " + error);
+                            } else {
+                                Object result = p.getResult();
+                                ModuleLog.line("(IE|InstantUpload) A02 completed resultType="
+                                        + (result == null ? "null" : result.getClass().getName()));
                             }
                         }
                     });
