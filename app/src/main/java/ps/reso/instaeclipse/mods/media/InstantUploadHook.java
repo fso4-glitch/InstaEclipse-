@@ -100,7 +100,8 @@ public class InstantUploadHook {
                 final Class<?>[] types = method.getParameterTypes();
                 int bitmaps = 0;
                 for (Class<?> type : types) if (type == Bitmap.class) bitmaps++;
-                if (bitmaps < 2) continue;
+                // A02 is the photo send candidate; A03 belongs to the video path.
+                if (!"A02".equals(method.getName()) || bitmaps != 1) continue;
                 try {
                     XposedBridge.hookMethod(method, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
@@ -116,10 +117,7 @@ public class InstantUploadHook {
                                     return;
                                 }
                                 Bitmap photo = pendingBitmap;
-                                if (photo == null) {
-                                    ModuleLog.line("(IE|InstantUpload) PHOTO_CAPTURE_NO_PENDING method=" + method.getName());
-                                    return;
-                                }
+                                if (photo == null) return;
                                 if (System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
                                     pendingBitmap = null;
                                     return;
