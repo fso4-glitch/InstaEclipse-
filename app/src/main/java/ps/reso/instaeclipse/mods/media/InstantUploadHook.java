@@ -1,6 +1,11 @@
 package ps.reso.instaeclipse.mods.media;
 
 import android.app.Activity;
+import android.content.Context;
+import android.media.MediaMetadataRetriever;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -49,6 +54,9 @@ public class InstantUploadHook {
     private static final int PICK_REQUEST = 0x1E5A; // unique request code for our picker
 
     static volatile Bitmap pendingBitmap;
+    private static volatile File pendingVideoFile;
+    private static volatile long pendingVideoSetAt;
+    private static volatile Method videoSendMethod;
     private static volatile long pendingSetAt = 0;   // when pendingBitmap was armed (staleness guard)
     private static final long PENDING_TTL_MS = 5 * 60 * 1000;
     private static TextView chip;              // the injected gallery chip (main thread only)
@@ -58,6 +66,7 @@ public class InstantUploadHook {
 
     public void install(ClassLoader cl) {
         hookSwap(cl);
+        hookVideoSwap(cl);
         hookCameraOpen(cl);
         hookPickerResult();
     }
@@ -80,7 +89,13 @@ public class InstantUploadHook {
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
                             try {
-                                if (!FeatureFlags.uploadInstants || pendingBitmap == null) return;
+                                if (!FeatureFlags.uploadInstants) return;
+                                if (pendingVideoFile != null && dispatchPendingVideoFromPhotoTap(p.args)) {
+                                    p.setResult(null);
+                                    FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                                    return;
+                                }
+                                if (pendingBitmap == null) return;
                                 if (System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
                                     pendingBitmap = null;
                                     return;
@@ -120,6 +135,138 @@ public class InstantUploadHook {
             ModuleLog.line("(IE|InstantUpload) photo candidate hooks installed=" + hooked);
         } catch (Throwable t) {
             ModuleLog.line("(IE|InstantUpload) photo hook install error: " + t);
+        }
+    }
+
+    // Recovered from the user's working video APK (JADX), adapted for this source tree.
+    private void hookVideoSwap(ClassLoader cl) {
+        try {
+            Class<?> vm = XposedHelpers.findClass(VM_CLASS, cl);
+            int hooked = 0;
+            for (Method m : vm.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers())) continue;
+                Class<?>[] types = m.getParameterTypes();
+                int fileIndex = -1;
+                boolean hasBitmap = false, hasContext = false;
+                for (int i = 0; i < types.length; i++) {
+                    if (types[i] == File.class && fileIndex < 0) fileIndex = i;
+                    if (types[i] == Bitmap.class) hasBitmap = true;
+                    if (Context.class.isAssignableFrom(types[i])) hasContext = true;
+                }
+                if (fileIndex < 0 || !hasBitmap || !hasContext) continue;
+                m.setAccessible(true);
+                if (videoSendMethod == null) videoSendMethod = m;
+                final int idx = fileIndex;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            File pending = pendingVideoFile;
+                            if (pending == null) return;
+                            if (System.currentTimeMillis() - pendingVideoSetAt > PENDING_TTL_MS) {
+                                safeDelete(pending);
+                                pendingVideoFile = null;
+                                return;
+                            }
+                            if (!FeatureFlags.uploadInstants || idx >= p.args.length
+                                    || !(p.args[idx] instanceof File)) return;
+                            p.args[idx] = pending;
+                            pendingVideoFile = null;
+                            FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                            ModuleLog.line("(IE|InstantUpload) swapped in gallery video file");
+                        } catch (Throwable t) {
+                            ModuleLog.line("(IE|InstantUpload) video swap: " + t);
+                        }
+                    }
+                });
+                hooked++;
+            }
+            ModuleLog.line("(IE|InstantUpload) video-file hooks=" + hooked);
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) video hook install: " + t);
+        }
+    }
+
+    private static boolean dispatchPendingVideoFromPhotoTap(Object[] photoArgs) {
+        Method method = videoSendMethod;
+        File video = pendingVideoFile;
+        if (method == null || video == null) return false;
+        if (System.currentTimeMillis() - pendingVideoSetAt > PENDING_TTL_MS) {
+            safeDelete(video);
+            pendingVideoFile = null;
+            return false;
+        }
+        try {
+            Class<?>[] types = method.getParameterTypes();
+            Object[] args = new Object[types.length];
+            Activity act = currentActivity();
+            Bitmap frame = null;
+            for (Object a : photoArgs) if (a instanceof Bitmap) { frame = (Bitmap) a; break; }
+            for (int i = 0; i < types.length; i++) {
+                Class<?> type = types[i];
+                if (type == File.class) args[i] = video;
+                else if (Context.class.isAssignableFrom(type)) args[i] = act;
+                else if (type == Bitmap.class) args[i] = frame;
+                else {
+                    Object found = null;
+                    for (Object a : photoArgs) {
+                        if (a != null && type.isInstance(a)) { found = a; break; }
+                    }
+                    if (found != null) args[i] = found;
+                    else if (type == boolean.class) args[i] = false;
+                    else if (type == byte.class) args[i] = (byte) 0;
+                    else if (type == short.class) args[i] = (short) 0;
+                    else if (type == int.class) args[i] = 0;
+                    else if (type == long.class) args[i] = 0L;
+                    else if (type == float.class) args[i] = 0f;
+                    else if (type == double.class) args[i] = 0d;
+                    else if (type == char.class) args[i] = (char) 0;
+                }
+            }
+            method.invoke(null, args);
+            if (pendingVideoFile == video) pendingVideoFile = null;
+            ModuleLog.line("(IE|InstantUpload) dispatched gallery video from shutter tap");
+            return true;
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) video dispatch failed: " + t);
+            return false;
+        }
+    }
+
+    private static File copyVideoToCache(Activity act, Uri uri, String mime) {
+        File out = null;
+        try {
+            out = new File(act.getCacheDir(), "instaeclipse_instant_"
+                    + System.currentTimeMillis() + (mime != null && mime.contains("quicktime") ? ".mov" : ".mp4"));
+            try (InputStream in = act.getContentResolver().openInputStream(uri);
+                 FileOutputStream fos = new FileOutputStream(out)) {
+                if (in == null) return null;
+                byte[] buffer = new byte[65536];
+                int n;
+                while ((n = in.read(buffer)) != -1) fos.write(buffer, 0, n);
+            }
+            if (out.length() > 0) return out;
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) video copy: " + t);
+        }
+        safeDelete(out);
+        return null;
+    }
+
+    private static void safeDelete(File file) {
+        if (file != null) try { file.delete(); } catch (Throwable ignored) {}
+    }
+
+    private static void markChipReadyVideo(Activity act, Uri uri) {
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(act, uri);
+            Bitmap frame = retriever.getFrameAtTime(0);
+            if (frame != null) markChipReady(act, downscale(frame));
+            if (chip != null) chip.setText("Vídeo pronto ✓");
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|InstantUpload) video preview: " + t);
+        } finally {
+            try { retriever.release(); } catch (Throwable ignored) {}
         }
     }
 
@@ -271,7 +418,8 @@ public class InstantUploadHook {
     private static void launchPicker(Activity act) {
         try {
             Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-            i.setType("image/*");
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
             i.addCategory(Intent.CATEGORY_OPENABLE);
             act.startActivityForResult(Intent.createChooser(i,
                     I18n.t(act, R.string.ig_instant_upload_chip)), PICK_REQUEST);
@@ -294,6 +442,23 @@ public class InstantUploadHook {
                                 Uri uri = ((Intent) p.args[2]).getData();
                                 if (uri == null) return;
                                 Activity act = (Activity) p.thisObject;
+                                String mime = act.getContentResolver().getType(uri);
+                                if (mime != null && mime.startsWith("video/")) {
+                                    File video = copyVideoToCache(act, uri, mime);
+                                    if (video == null) {
+                                        Toast.makeText(act, "Não foi possível preparar o vídeo", Toast.LENGTH_SHORT).show();
+                                        return;
+                                    }
+                                    safeDelete(pendingVideoFile);
+                                    pendingVideoFile = video;
+                                    pendingVideoSetAt = System.currentTimeMillis();
+                                    pendingBitmap = null;
+                                    markChipReadyVideo(act, uri);
+                                    Toast.makeText(act, "Vídeo pronto. Segure o botão branco", Toast.LENGTH_LONG).show();
+                                    return;
+                                }
+                                safeDelete(pendingVideoFile);
+                                pendingVideoFile = null;
                                 Bitmap bmp = decode(act, uri);
                                 if (bmp == null) {
                                     Toast.makeText(act, I18n.t(act, R.string.ig_instant_upload_fail),
