@@ -71,44 +71,75 @@ public class InstantUploadHook {
         hookPickerResult();
     }
 
-    // ── 4. The bitmap swap (verified: A02 arg1 = captured Bitmap) ──────────────
+    // Photo pipeline: instrument every plausible Bitmap send entry point.
+    // Only replace Bitmap arguments when a gallery photo is pending.
     private void hookSwap(ClassLoader cl) {
         try {
             Class<?> vm = XposedHelpers.findClass(VM_CLASS, cl);
-            Method a02 = null;
-            for (Method m : vm.getDeclaredMethods()) {
-                if (!Modifier.isStatic(m.getModifiers())) continue;
-                int bmp = 0;
-                for (Class<?> t : m.getParameterTypes()) if (t == Bitmap.class) bmp++;
-                if (bmp >= 2) { a02 = m; break; }
-            }
-            if (a02 == null) { ModuleLog.line("(IE|InstantUpload) ⚠️ A02 not found"); return; }
-            XposedBridge.hookMethod(a02, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!(p.args[1] instanceof Bitmap)) return; // suspend re-entry passes nulls
-                        // Drop a stale pick so it can't hijack a much-later real capture.
-                        if (pendingBitmap != null
-                                && System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
-                            pendingBitmap = null;
+            int hooked = 0;
+            for (Method method : vm.getDeclaredMethods()) {
+                if (!Modifier.isStatic(method.getModifiers())) continue;
+                final Class<?>[] types = method.getParameterTypes();
+                int bitmaps = 0;
+                for (Class<?> type : types) if (type == Bitmap.class) bitmaps++;
+                if (bitmaps < 2) continue;
+                try {
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            try {
+                                if (!FeatureFlags.uploadInstants) return;
+                                File video = pendingVideoFile;
+                                if (video != null) {
+                                    // Preserve the video path from the recovered APK.
+                                    if (dispatchPendingVideoFromPhotoTap(p.args)) {
+                                        p.setResult(null);
+                                        FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                                    }
+                                    return;
+                                }
+                                Bitmap photo = pendingBitmap;
+                                if (photo == null) return;
+                                if (System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
+                                    pendingBitmap = null;
+                                    return;
+                                }
+                                int primary = -1;
+                                int secondary = -1;
+                                for (int i = 0; i < types.length && i < p.args.length; i++) {
+                                    if (types[i] != Bitmap.class || !(p.args[i] instanceof Bitmap)) continue;
+                                    if (primary < 0) primary = i;
+                                    else if (secondary < 0) secondary = i;
+                                }
+                                if (primary < 0) {
+                                    ModuleLog.line("(IE|InstantUpload) photo pending, no live Bitmap in " + method.getName());
+                                    return;
+                                }
+                                p.args[primary] = photo;
+                                if (secondary >= 0) {
+                                    Bitmap.Config cfg = photo.getConfig();
+                                    p.args[secondary] = photo.copy(
+                                            cfg != null ? cfg : Bitmap.Config.ARGB_8888, false);
+                                }
+                                pendingBitmap = null;
+                                FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
+                                ModuleLog.line("(IE|InstantUpload) photo swapped in "
+                                        + method.getName() + " at " + primary + "/" + secondary);
+                            } catch (Throwable t) {
+                                ModuleLog.line("(IE|InstantUpload) photo swap error: " + t);
+                            }
                         }
-                        if (FeatureFlags.uploadInstants && pendingBitmap != null) {
-                            p.args[1] = pendingBitmap;
-                            if (p.args[2] != null)
-                                p.args[2] = pendingBitmap.copy(pendingBitmap.getConfig(), false);
-                            pendingBitmap = null;
-                            FeedVideoDownloadHook.mainHandler.post(InstantUploadHook::removeChip);
-                            ModuleLog.line("(IE|InstantUpload) ✅ swapped in gallery bitmap");
-                        }
-                    } catch (Throwable t) {
-                        ModuleLog.line("(IE|InstantUpload) ❌ swap: " + t);
-                    }
+                    });
+                    hooked++;
+                    ModuleLog.line("(IE|InstantUpload) photo candidate hooked: "
+                            + method.getName() + " args=" + types.length);
+                } catch (Throwable t) {
+                    ModuleLog.line("(IE|InstantUpload) photo candidate hook failed: " + t);
                 }
-            });
-            FeatureStatusTracker.setHooked("UploadInstants");
-            ModuleLog.line("(IE|InstantUpload) ✅ A02 hooked");
+            }
+            if (hooked > 0) FeatureStatusTracker.setHooked("UploadInstants");
+            ModuleLog.line("(IE|InstantUpload) photo hooks installed=" + hooked);
         } catch (Throwable t) {
-            ModuleLog.line("(IE|InstantUpload) ⚠️ swap install: " + t.getMessage());
+            ModuleLog.line("(IE|InstantUpload) photo install error: " + t);
         }
     }
 
