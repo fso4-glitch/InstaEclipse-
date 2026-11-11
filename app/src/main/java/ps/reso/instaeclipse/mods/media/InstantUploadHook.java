@@ -98,7 +98,10 @@ public class InstantUploadHook {
                                     return;
                                 }
                                 Bitmap photo = pendingBitmap;
-                                if (photo == null) return;
+                                if (photo == null) {
+                                    ModuleLog.line("(IE|InstantUpload) PHOTO_CAPTURE_NO_PENDING method=" + method.getName());
+                                    return;
+                                }
                                 if (System.currentTimeMillis() - pendingSetAt > PENDING_TTL_MS) {
                                     pendingBitmap = null;
                                     return;
@@ -110,6 +113,7 @@ public class InstantUploadHook {
                                     if (primary < 0) primary = i;
                                     else if (secondary < 0) secondary = i;
                                 }
+                                ModuleLog.line("(IE|InstantUpload) PHOTO_CAPTURE_CANDIDATE method=" + method.getName() + " primary=" + primary + " secondary=" + secondary);
                                 if (primary < 0) {
                                     ModuleLog.line("(IE|InstantUpload) photo pending, no live Bitmap in " + method.getName());
                                     return;
@@ -472,6 +476,7 @@ public class InstantUploadHook {
                                 }
                                 pendingBitmap = bmp;
                                 pendingSetAt = System.currentTimeMillis();
+                                ModuleLog.line("(IE|InstantUpload) PHOTO_PICK_READY size=" + bmp.getWidth() + "x" + bmp.getHeight());
                                 markChipReady(act, bmp);
                                 Toast.makeText(act, I18n.t(act, R.string.ig_instant_upload_ready),
                                         Toast.LENGTH_LONG).show();
